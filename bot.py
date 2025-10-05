@@ -11,7 +11,8 @@ try:
 except Exception:
     TOKYO = None
 import schedule
-import time
+from flask import Flask
+import threading
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,6 +27,17 @@ intents = discord.Intents.default()
 intents.members = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="/", intents=intents)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Discord bot is running on Render!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))  # Renderが環境変数PORTを設定する
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web).start()
 
 # --- ガードフラグ（on_ready が複数回呼ばれる対策） ---
 _ready_once = False
