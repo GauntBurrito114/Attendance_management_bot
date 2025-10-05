@@ -28,6 +28,7 @@ intents.members = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 app = Flask(__name__)
+last_processed = {}
 
 @app.route('/')
 def home():
@@ -152,98 +153,80 @@ async def mark_user_attendance(member: discord.abc.Snowflake, role: discord.Role
         logger.exception("不明な原因により %s の出席を記録できませんでした", getattr(member, "id", None))
         return False
 # payload の発火を受け、attendance message の ✅ を付けている全ユーザー（bot を除く）に対してまだロールがなければロールを付与記録チャンネルに「@ユーザーがYYYY年MM月DD日 HH:MMに出席しました。」を送信を行い、最後に payload を発火させた本人（payload.user_id）のリアクションを削除します。
-async def handle_attendance_reaction(payload: discord.RawReactionActionEvent):
+async def handle_attendance_reaction(payload):
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        logger.warning("Guildが見つかりませんでした: %s", payload.guild_id)
+        return
+
+    # 5秒以内の同一ユーザーの反応は無視してAPI負荷を軽減
+    now = asyncio.get_event_loop().time()
+    if payload.user_id in last_processed and now - last_processed[payload.user_id] < 5:
+        logger.info("短時間での再反応をスキップ: user_id=%s", payload.user_id)
+        return
+    last_processed[payload.user_id] = now
+
+    # 各オブジェクトを取得
+    channel = guild.get_channel(payload.channel_id)
+    if not channel:
+        logger.error("チャンネルが見つかりません: %s", payload.channel_id)
+        return
+
+    # キャッシュにある場合はfetchせず使用
     try:
-        # --- 基本チェック（冗長でも安全） ---
-        if ATTENDANCE_MESSAGE_ID == 0:
-            logger.warning("ATTENDANCE_MESSAGE_IDが設定されていません。.")
-            return
-
-        if payload.message_id != ATTENDANCE_MESSAGE_ID:
-            logger.debug("出席メッセージ %s ではありません。",
-                         payload.message_id, ATTENDANCE_MESSAGE_ID)
-            return
-
-        if not is_check_mark(payload.emoji):
-            logger.debug("絵文字 %s はチェックマークではありません", payload.emoji)
-            return
-
-        guild = bot.get_guild(payload.guild_id)
-        if guild is None:
-            logger.error("ギルド %s がキャッシュ内に見つかりません", payload.guild_id)
-            return
-
-        role = guild.get_role(ATTENDANCE_ROLE_ID)
-        if role is None:
-            logger.error("出席ロール ID %s がギルド %s に見つかりません", ATTENDANCE_ROLE_ID, guild.id)
-            return
-
-        record_channel = await fetch_channel_safe(bot, ATTENDANCE_RECORD_CHANNEL_ID)
-        if record_channel is None or not isinstance(record_channel, discord.TextChannel):
-            logger.error("出席記録チャンネルID %sが見つからないか、テキストチャンネルではありません", ATTENDANCE_RECORD_CHANNEL_ID)
-            return
-
-        channel = await fetch_channel_safe(bot, payload.channel_id)
-        if channel is None:
-            logger.error("チャンネル %s が見つかりません", payload.channel_id)
-            return
-
+        message = channel.get_partial_message(payload.message_id)
         try:
-            message = await channel.fetch_message(payload.message_id)
-        except Exception:
-            logger.exception("チャネル %s のメッセージ %s を取得できませんでした", payload.message_id, channel.id)
+            message = await message.fetch()
+        except discord.errors.HTTPException as e:
+            logger.warning("メッセージ取得をスキップ: %s", e)
             return
+    except Exception as e:
+        logger.error("メッセージオブジェクトの取得に失敗: %s", e)
+        return
 
-        target_reaction = None
-        for react in message.reactions:
-            if is_check_mark(react.emoji):
-                target_reaction = react
-                break
-        # もしリアクションが見つからなければ終了
-        if target_reaction is None:
-            return
-        # --- ✅リアクションを付けているユーザーを列挙 ---
-        try:
-            users = [u async for u in target_reaction.users()]
-        except Exception:
-            logger.exception("メッセージ %s へのユーザー応答の反復に失敗しました", message.id)
-            users = []
+    # bot自身のリアクションは無視
+    if payload.user_id == bot.user.id:
+        return
 
-        # 各ユーザーを処理する
-        for user in users:
-            if getattr(user, "bot", False):
-                continue
+    # ユーザー・ロール・チャンネルの取得
+    member = guild.get_member(payload.user_id)
+    if not member:
+        logger.warning("メンバーが見つかりません: %s", payload.user_id)
+        return
 
-            # メンバーを取得
-            member = await fetch_member_safe(guild, user.id)
-            if member is None:
-                logger.warning("ギルド %s のメンバー %s を取得できませんでした。", user.id, guild.id)
-                continue
+    attendance_role_id = int(os.getenv("ATTENDANCE_ROLE_ID", "0"))
+    record_channel_id = int(os.getenv("ATTENDANCE_RECORD_CHANNEL_ID", "0"))
+    attendance_role = guild.get_role(attendance_role_id)
+    record_channel = guild.get_channel(record_channel_id)
 
-            # すでにロールがある場合はスキップ
-            if isinstance(member, discord.Member) and role in member.roles:
-                logger.debug("メンバー %s はすでに出席ロールを付与されています", member.id)
-                continue
-            # 出席を記録
-            ok = await mark_user_attendance(member, role, record_channel)
-            # APIのレートリミット対策
-            await asyncio.sleep(1)
-        # リアクションの削除
-        try:
-            reactor_member = await fetch_member_safe(guild, payload.user_id)
-            if reactor_member is None:
-                reactor_user = await bot.fetch_user(payload.user_id)
-            else:
-                reactor_user = reactor_member
+    if not attendance_role or not record_channel:
+        logger.error("ロールまたは記録チャンネルが見つかりません")
+        return
 
-            await message.remove_reaction(payload.emoji, reactor_user)
-        except discord.Forbidden:
-            logger.exception("チャンネル %s のリアクションを削除する権限がありません", channel.id)
-        except Exception:
-            logger.exception("メッセージ %s に対するユーザー %s のリアクションを削除できませんでした", payload.user_id, message.id)
+    # すでにロールを持っていたら処理をスキップ
+    if attendance_role in member.roles:
+        logger.info("%s はすでに出席ロールを持っています。処理をスキップします。", member.name)
+        return
 
-    except Exception:
-        logger.exception("handle_attendance_reaction で例外が発生しました")
+    try:
+        # 出席ロール付与
+        await member.add_roles(attendance_role, reason="出席確認")
+        now = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
+        await record_channel.send(f"{member.mention} が {now} に出席しました。")
+        logger.info("出席を記録: %s", member.name)
+
+        # ✅リアクションを削除して次の処理へ
+        await message.remove_reaction(payload.emoji, member)
+
+        # 少し待って次の処理へ（Discord API 負荷軽減）
+        await asyncio.sleep(1)
+
+    except discord.Forbidden:
+        logger.error("権限が不足しています。ロールを付与できません。")
+    except discord.HTTPException as e:
+        logger.error("出席処理中にHTTPエラー: %s", e)
+    except Exception as e:
+        logger.exception("出席処理中に予期せぬエラーが発生しました: %s", e)
 
 # 毎日深夜0時に出席ロールを全員からはく奪する
 async def remove_attendance_roles():
