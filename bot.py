@@ -35,7 +35,7 @@ async def keepalive_task():
     try:
         while True:
             logger.info("keep alive ok!")
-            await asyncio.sleep(5)  # テスト用: 5秒。運用時は 180 に
+            await asyncio.sleep(180)  # テスト用: 5秒。運用時は 180 に
     except asyncio.CancelledError:
         # シャットダウン時にタスクがキャンセルされるとここに来る
         logger.info("keepalive_taskがキャンセルされました")
