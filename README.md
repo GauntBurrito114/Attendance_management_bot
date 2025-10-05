@@ -1,0 +1,1 @@
+Dscord用出席管理BOT
