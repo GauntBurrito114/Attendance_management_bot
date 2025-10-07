@@ -3,6 +3,7 @@ import logging
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
 from datetime import datetime
 try:
@@ -13,6 +14,7 @@ except Exception:
 import schedule
 from flask import Flask
 import threading
+import sys
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -48,7 +50,7 @@ async def keepalive_task():
     try:
         while True:
             logger.info("keep alive ok!")
-            await asyncio.sleep(180)  # テスト用: 5秒。運用時は 180 に
+            await asyncio.sleep(180)
     except asyncio.CancelledError:
         # シャットダウン時にタスクがキャンセルされるとここに来る
         logger.info("keepalive_taskがキャンセルされました")
@@ -261,7 +263,7 @@ async def remove_attendance_roles():
                 logger.exception("%s からロールを削除中にエラーが発生しました: %s", member.name, e)
 
             # API制限回避のための5秒スリープ
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
         logger.info("出席ロールの削除が完了しました")
 
@@ -277,6 +279,101 @@ async def schedule_task():
         schedule.run_pending()
         await asyncio.sleep(1)
 
+
+
+# --- botのコマンドたち　---
+
+
+# --- /testコマンド ---
+@bot.tree.command(name="test", description="テストメッセージを送ります")
+async def slash_test(interaction: discord.Interaction):
+    try:
+        await interaction.response.send_message("テストメッセージです。")
+        logger.info("/test が %s によって実行されました (%s)", interaction.user, interaction.user.id)
+    except Exception:
+        logger.exception("/testの実行に失敗しました")
+
+
+# --- /attendance コマンド ---
+@bot.tree.command(name="attendance", description="指定したメンバーに出席を付与します（管理者権限が必要）")
+@app_commands.describe(member="出席を付与するメンバー")
+async def slash_attendance(interaction: discord.Interaction, member: discord.Member):
+    # 実行権限の確認
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("このコマンドを実行する権限がありません（Manage Roles が必要）", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("ギルドコンテキストで実行してください。", ephemeral=True)
+        return
+
+    # ATTENDANCE_ROLE_ID / ATTENDANCE_RECORD_CHANNEL_ID は .env から読み込んである前提
+    role = guild.get_role(ATTENDANCE_ROLE_ID)
+    record_channel = await fetch_channel_safe(bot, ATTENDANCE_RECORD_CHANNEL_ID)
+
+    if role is None:
+        await interaction.response.send_message("出席ロールが見つかりません", ephemeral=True)
+        return
+    if record_channel is None or not isinstance(record_channel, discord.TextChannel):
+        await interaction.response.send_message("記録チャンネルが見つかりません", ephemeral=True)
+        return
+
+    # 既にロールがあるかチェック
+    if role in member.roles:
+        await interaction.response.send_message(f"{member.display_name} は既に出席ロールを持っています", ephemeral=True)
+        return
+
+    # 実際の処理：mark_user_attendance を再利用
+    try:
+        ok = await mark_user_attendance(member, role, record_channel)
+        if ok:
+            await interaction.response.send_message(f"{member.display_name} に出席を付与しました", ephemeral=True)
+            logger.info("/attendance: %s に出席付与を実行しました by %s", member.id, interaction.user.id)
+        else:
+            await interaction.response.send_message("ロール付与に失敗しました", ephemeral=True)
+    except Exception:
+        logger.exception("Exception in /attendance command")
+        await interaction.response.send_message("エラーが発生しました", ephemeral=True)
+
+
+#--- /stop コマンド ---
+async def _shutdown_bot_after_delay(delay_seconds: float = 2.0):
+    """内部で使うシャットダウンヘルパー（少し遅らせて応答を送らせてから停止）"""
+    await asyncio.sleep(delay_seconds)
+    try:
+        logger.info("Shutting down bot (closing)...")
+        await bot.close()
+    except Exception:
+        logger.exception("Error while closing bot")
+    finally:
+        logger.info("Exiting process now")
+        # os._exit や sys.exit を使ってプロセスを強制終了
+        try:
+            os._exit(0)
+        except Exception:
+            sys.exit(0)
+
+@bot.tree.command(name="stop", description="Bot を停止します（管理者のみ）")
+async def slash_stop(interaction: discord.Interaction):
+    # 実行権限の確認
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("このコマンドを実行する権限がありません（Manage Roles が必要）", ephemeral=True)
+        return
+
+    # まずユーザーに応答してからシャットダウン予約
+    try:
+        await interaction.response.send_message("ボットを停止します。数秒後にプロセスを終了します。", ephemeral=True)
+        logger.info("Shutdown requested by %s (%s)", interaction.user, interaction.user.id)
+        asyncio.create_task(_shutdown_bot_after_delay(2.0))
+    except Exception:
+        logger.exception("Failed to send shutdown response; forcing shutdown immediately")
+        # 最後の手段で即座に停止
+        try:
+            await bot.close()
+        finally:
+            os._exit(0)
+
 @bot.event
 async def on_ready():
     global _ready_once
@@ -288,8 +385,15 @@ async def on_ready():
 
     # バックグラウンドタスクを起動（create_task_with_logging を使って例外追跡）
     create_task_with_logging(keepalive_task())
-    create_task_with_logging(schedule_task())
-
+    create_task_with_logging(schedule_task()) 
+    try:
+        await bot.tree.sync()
+        logger.info("コマンドツリーを同期しました")
+    except Exception:
+        logger.exception("コマンドツリーの同期に失敗しました")
+        
+           
+# --- Botの起動 ---
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN is not set")
