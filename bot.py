@@ -46,17 +46,16 @@ threading.Thread(target=run_web).start()
 _ready_once = False
 
 # --- keepalive の定義は起動前に ---
-async def keepalive_task():
-    try:
-        while True:
-            logger.info("keep alive ok!")
-            await asyncio.sleep(180)
-    except asyncio.CancelledError:
-        # シャットダウン時にタスクがキャンセルされるとここに来る
-        logger.info("keepalive_taskがキャンセルされました")
-        raise
-    except Exception:
-        logger.exception("keepalive_taskが例外で終了しました")
+async def watchdog_task():
+    while True:
+        await asyncio.sleep(300)  # 5分ごとに監視
+        if not bot.is_closed():
+            continue
+        try:
+            logger.warning("Bot seems disconnected. Restarting process.")
+            os._exit(1)  # Renderが自動再起動
+        except Exception:
+            pass
 
 # --- タスクの作成と例外追跡 ---
 def create_task_with_logging(coro):
@@ -384,13 +383,13 @@ async def on_ready():
     logger.info("Bot is ready: %s (id=%s)", bot.user, bot.user.id)
 
     # バックグラウンドタスクを起動（create_task_with_logging を使って例外追跡）
-    create_task_with_logging(keepalive_task())
+    create_task_with_logging(watchdog_task())  
     create_task_with_logging(schedule_task()) 
     try:
         await bot.tree.sync()
         logger.info("コマンドツリーを同期しました")
     except Exception:
-        logger.exception("コマンドツリーの同期に失敗しました")
+        logger.exception("コマンドツリーの同期に失敗しました")        
         
            
 # --- Botの起動 ---
